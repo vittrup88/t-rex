@@ -9,14 +9,13 @@ use crate::core::layer::Layer;
 use crate::core::Config;
 use crate::datasource::postgis_fields::FeatureRow;
 use crate::datasource::DatasourceType;
-use fallible_iterator::FallibleIterator;
-use postgres::types::{self, ToSql};
-use postgres_native_tls::NativeTls;
+use native_tls::TlsConnector;
+use postgres::types::{ToSql, Type};
+use postgres_native_tls::MakeTlsConnector;
 use r2d2;
-use r2d2_postgres::{PostgresConnectionManager, TlsMode};
+use r2d2_postgres::PostgresConnectionManager;
 use std;
 use std::collections::BTreeMap;
-use std::error::Error;
 use tile_grid::Extent;
 use tile_grid::Grid;
 
@@ -38,7 +37,7 @@ pub struct SqlQuery {
 pub struct PostgisDatasource {
     pub connection_url: String,
     pub pool_size: Option<u16>,
-    conn_pool: Option<r2d2::Pool<PostgresConnectionManager>>,
+    conn_pool: Option<r2d2::Pool<PostgresConnectionManager<MakeTlsConnector>>>,
     // Queries for all tileset/layers and zoom levels
     queries: BTreeMap<String, BTreeMap<String, BTreeMap<u8, SqlQuery>>>,
 }
@@ -91,7 +90,7 @@ impl PostgisDatasource {
             queries: BTreeMap::new(),
         }
     }
-    fn conn(&self) -> r2d2::PooledConnection<PostgresConnectionManager> {
+    fn conn(&self) -> r2d2::PooledConnection<PostgresConnectionManager<MakeTlsConnector>> {
         let pool = self.conn_pool.as_ref().unwrap();
         //debug!("{:?}", pool);
         // Waits for at most Config::connection_timeout (default: 30s) before returning an error.
@@ -108,16 +107,16 @@ impl PostgisDatasource {
             field, table
         );
 
-        let conn = self.conn();
+        let mut conn = self.conn();
         let sql = format!(
             "SELECT DISTINCT GeometryType({}) AS geomtype FROM {}",
             field, table
         );
 
         let mut types: Vec<String> = Vec::new();
-        for row in &conn.query(&sql, &[]).unwrap() {
-            let geomtype = row.get_opt("geomtype");
-            match geomtype.unwrap() {
+        for row in conn.query(sql.as_str(), &[]).unwrap() {
+            let geomtype = row.try_get("geomtype");
+            match geomtype {
                 Ok(Some(val)) => {
                     types.push(val);
                 }
@@ -147,7 +146,7 @@ impl PostgisDatasource {
             ),
         };
         query = SqlQuery::valid_sql_for_params(&query);
-        let conn = self.conn();
+        let mut conn = self.conn();
         let stmt = conn.prepare(&query);
         match stmt {
             Err(e) => {
@@ -162,16 +161,16 @@ impl PostgisDatasource {
                         let name = col.name().to_string();
                         let ty = col.type_();
                         let cast = match ty {
-                            &types::VARCHAR
-                            | &types::TEXT
-                            | &types::CHAR_ARRAY
-                            | &types::FLOAT4
-                            | &types::FLOAT8
-                            | &types::INT2
-                            | &types::INT4
-                            | &types::INT8
-                            | &types::BOOL => String::new(),
-                            &types::NUMERIC => "FLOAT8".to_string(),
+                            &Type::VARCHAR
+                            | &Type::TEXT
+                            | &Type::CHAR_ARRAY
+                            | &Type::FLOAT4
+                            | &Type::FLOAT8
+                            | &Type::INT2
+                            | &Type::INT4
+                            | &Type::INT8
+                            | &Type::BOOL => String::new(),
+                            &Type::NUMERIC => "FLOAT8".to_string(),
                             _ => match ty.name() {
                                 "geometry" => String::new(),
                                 _ => "TEXT".to_string(),
@@ -189,7 +188,6 @@ impl PostgisDatasource {
                         (name, cast)
                     })
                     .collect();
-                let _ = stmt.finish();
                 cols
             }
         }
@@ -199,16 +197,16 @@ impl PostgisDatasource {
         use postgis::ewkb;
         use postgis::{LineString, Point, Polygon}; // conflicts with core::geom::Point etc.
 
-        let conn = self.conn();
-        let rows = conn.query(&sql, &[]).unwrap();
+        let mut conn = self.conn();
+        let rows = conn.query(sql.as_str(), &[]).unwrap();
         let extpoly = rows
             .into_iter()
             .nth(0)
             .expect("row expected")
-            .get_opt::<_, ewkb::Polygon>("extent");
+            .try_get::<_, ewkb::Polygon>("extent");
         match extpoly {
-            Some(Ok(ref poly)) if poly.rings().len() != 1 => None,
-            Some(Ok(poly)) => {
+            Ok(ref poly) if poly.rings().len() != 1 => None,
+            Ok(poly) => {
                 let p1 = poly.rings().nth(0).unwrap().points().nth(0).unwrap();
                 let p2 = poly.rings().nth(0).unwrap().points().nth(2).unwrap();
                 Some(Extent {
@@ -453,28 +451,15 @@ impl PostgisDatasource {
 impl DatasourceType for PostgisDatasource {
     /// New instance with connected pool
     fn connected(&self) -> PostgisDatasource {
-        // Emulate TlsMode::Allow (https://github.com/sfackler/rust-postgres/issues/278)
+        // TlsMode::Allow is not available (https://github.com/sfackler/rust-postgres/issues/278)
+        // See also https://github.com/joyent/rust-cueball-postgres-connection/blob/master/src/lib.rs
+        let connector = MakeTlsConnector::new(TlsConnector::new().unwrap());
         let manager =
-            PostgresConnectionManager::new(self.connection_url.as_ref(), TlsMode::None).unwrap();
+            PostgresConnectionManager::new(self.connection_url.parse().unwrap(), connector);
         let pool_size = self.pool_size.unwrap_or(8); // TODO: use number of workers as default pool size
         let pool = r2d2::Pool::builder()
             .max_size(pool_size as u32)
             .build(manager)
-            .or_else(|e| match e.description() {
-                "unable to initialize connections" => {
-                    info!("Couldn't connect with TlsMode::None - retrying with TlsMode::Require");
-                    let negotiator = NativeTls::new().unwrap();
-                    let manager = PostgresConnectionManager::new(
-                        self.connection_url.as_ref(),
-                        TlsMode::Require(Box::new(negotiator)),
-                    )
-                    .unwrap();
-                    r2d2::Pool::builder()
-                        .max_size(pool_size as u32)
-                        .build(manager)
-                }
-                _ => Err(e),
-            })
             .unwrap();
         PostgisDatasource {
             connection_url: self.connection_url.clone(),
@@ -486,7 +471,7 @@ impl DatasourceType for PostgisDatasource {
     fn detect_layers(&self, detect_geometry_types: bool) -> Vec<Layer> {
         info!("Detecting layers from geometry_columns");
         let mut layers: Vec<Layer> = Vec::new();
-        let conn = self.conn();
+        let mut conn = self.conn();
         let sql = "SELECT * FROM geometry_columns ORDER BY f_table_schema,f_table_name DESC";
         for row in &conn.query(sql, &[]).unwrap() {
             let schema: String = row.get("f_table_schema");
@@ -649,13 +634,13 @@ impl DatasourceType for PostgisDatasource {
     where
         F: FnMut(&dyn Feature),
     {
-        let conn = self.conn();
+        let mut conn = self.conn();
         let query = self.query(&tileset.to_string(), &layer.name, zoom);
         if query.is_none() {
             return 0;
         }
         let query = query.unwrap();
-        let stmt = conn.prepare_cached(&query.sql);
+        let stmt = conn.prepare(&query.sql);
         if let Err(err) = stmt {
             error!("Layer '{}': {}", layer.name, err);
             error!("Query: {}", query.sql);
@@ -670,7 +655,7 @@ impl DatasourceType for PostgisDatasource {
         for param in &query.params {
             match param {
                 &QueryParam::Bbox => {
-                    let mut bbox: Vec<&dyn ToSql> =
+                    let mut bbox: Vec<&(dyn ToSql + Sync)> =
                         vec![&extent.minx, &extent.miny, &extent.maxx, &extent.maxy];
                     params.append(&mut bbox);
                 }
@@ -683,8 +668,9 @@ impl DatasourceType for PostgisDatasource {
         }
 
         let stmt = stmt.unwrap();
-        let trans = conn.transaction().expect("transaction already active");
-        let rows = stmt.lazy_query(&trans, &params.as_slice(), 50);
+        let mut trans = conn.transaction().expect("transaction already active");
+        let portal = trans.bind(&stmt, &params[..]).unwrap();
+        let rows = trans.query_portal(&portal, 50);
         if let Err(err) = rows {
             error!("Layer '{}': {}", layer.name, err);
             error!("Query: {}", query.sql);
@@ -695,10 +681,10 @@ impl DatasourceType for PostgisDatasource {
         debug!("Reading features in layer {}", layer.name);
         let mut cnt = 0;
         let query_limit = layer.query_limit.unwrap_or(0);
-        for row in rows.unwrap().iterator() {
+        for row in rows.unwrap() {
             let feature = FeatureRow {
                 layer: layer,
-                row: &row.unwrap(),
+                row: &row,
             };
             read(&feature);
             cnt += 1;

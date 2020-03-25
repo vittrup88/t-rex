@@ -8,8 +8,7 @@ use crate::core::geom::*;
 use crate::core::layer::{Layer, LayerQuery};
 use crate::datasource::postgis_ds::{PostgisDatasource, QueryParam};
 use crate::datasource::DatasourceType;
-use postgres;
-use postgres::Connection;
+use postgres::{Client, NoTls};
 use std::env;
 use tile_grid::Extent;
 use tile_grid::Grid;
@@ -17,8 +16,8 @@ use tile_grid::Grid;
 #[test]
 #[ignore]
 fn test_from_geom_fields() {
-    let conn: Connection = match env::var("DBCONN") {
-        Result::Ok(val) => Connection::connect(&val as &str, postgres::TlsMode::None),
+    let mut conn: Client = match env::var("DBCONN") {
+        Result::Ok(val) => Client::connect(&val as &str, NoTls),
         Result::Err(_) => panic!("DBCONN undefined"),
     }
     .unwrap();
@@ -50,11 +49,12 @@ fn test_from_geom_fields() {
     }
     let sql =
         "SELECT wkb_geometry, ST_AsBinary(wkb_geometry) FROM ne.rivers_lake_centerlines LIMIT 1";
-    let rows = &conn.query(sql, &[]).unwrap();
-    assert_eq!(rows.columns()[0].name(), "wkb_geometry");
-    assert_eq!(format!("{}", rows.columns()[0].type_()), "geometry");
-    assert_eq!(rows.columns()[1].name(), "st_asbinary");
-    assert_eq!(format!("{}", rows.columns()[1].type_()), "bytea");
+    let rows = conn.query(sql, &[]).unwrap();
+    let row = rows.first().unwrap();
+    assert_eq!(row.columns()[0].name(), "wkb_geometry");
+    assert_eq!(format!("{}", row.columns()[0].type_()), "geometry");
+    assert_eq!(row.columns()[1].name(), "st_asbinary");
+    assert_eq!(format!("{}", row.columns()[1].type_()), "bytea");
 }
 
 #[test]
@@ -350,22 +350,4 @@ fn test_no_geom_field() {
     //layer.geometry_field = Some(String::from("wkb_geometry"));
     layer.geometry_type = Some(String::from("POINT"));
     pg.prepare_queries("ts", &layer, 3857);
-}
-
-#[test]
-#[ignore]
-fn test_tls() {
-    use postgres::TlsMode;
-    use postgres_native_tls::NativeTls;
-    let negotiator = NativeTls::new().unwrap();
-    let _conn = match env::var("DBCONN") {
-        Result::Ok(val) => Connection::connect(&val as &str, TlsMode::Prefer(&negotiator)),
-        Result::Err(_) => panic!("DBCONN undefined"),
-    };
-    // Connection fails on Travis with
-    //  InitializationError(Some("Error opening a connection: Error initiating SSL session: The OpenSSL library reported an error: The OpenSSL library reported an error: error:14090086:SSL routines:SSL3_GET_SERVER_CERTIFICATE:certificate verify
-    // see https://github.com/sfackler/rust-postgres/issues/278
-    //assert!(conn.is_ok());
-    //assert!(conn.unwrap().execute("SELECT 1::VARCHAR", &[]).is_ok());
-    // Check pg_stat_ssl? https://www.postgresql.org/docs/9.6/static/monitoring-stats.html#PG-STAT-SSL-VIEW
 }

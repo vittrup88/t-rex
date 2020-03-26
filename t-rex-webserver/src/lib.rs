@@ -19,4 +19,4 @@ mod server;
 mod static_files;
 
 pub use crate::runtime_config::*;
-pub use crate::server::webserver;
+pub use crate::server::{setup_service, webserver};

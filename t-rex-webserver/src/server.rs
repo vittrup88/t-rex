@@ -199,8 +199,16 @@ async fn drilldown_handler(
     Ok(HttpResponse::Ok().json(json))
 }
 
+pub fn setup_service(args: ArgMatches<'static>) -> std::io::Result<MvtService> {
+    let config = config_from_args(&args);
+    let mut service = service_from_args(&config, &args);
+    service.prepare_feature_queries();
+    service.init_cache();
+    Ok(service)
+}
+
 #[actix_rt::main]
-pub async fn webserver(args: ArgMatches<'static>) -> std::io::Result<()> {
+pub async fn webserver(service: MvtService, args: ArgMatches<'static>) -> std::io::Result<()> {
     let config = config_from_args(&args);
     let host = config
         .webserver
@@ -214,10 +222,6 @@ pub async fn webserver(args: ArgMatches<'static>) -> std::io::Result<()> {
     let openbrowser =
         bool::from_str(args.value_of("openbrowser").unwrap_or("true")).unwrap_or(false);
     let static_dirs = config.webserver.static_.clone();
-
-    let mut service = service_from_args(&config, &args);
-    service.prepare_feature_queries();
-    service.init_cache();
 
     let server = HttpServer::new(move || {
         let mut app = App::new()

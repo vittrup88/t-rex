@@ -129,6 +129,7 @@ async fn tile_pbf(
     params: web::Path<(String, u8, u32, u32)>,
     req: HttpRequest,
 ) -> Result<HttpResponse> {
+    let query_string = req.query_string();
     let params = params.into_inner();
     let tileset = params.0;
     let z = params.1;

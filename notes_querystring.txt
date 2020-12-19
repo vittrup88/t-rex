@@ -1,0 +1,1 @@
+http://127.0.0.1:6767/ne_10m_populated_places/5/31/17.pbf?numberParam=42&stringParam=value&booleanParam=true&objectParam={"answer" : 42}&arrayParam=[1, 2, 3]
